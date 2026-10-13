@@ -1,0 +1,72 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  aiPr Link —— 让 Python 直接驱动 Premiere Pro 的 CEP 面板。
+
+  它做三件事：
+  1. 在 127.0.0.1:3000 起一个本地 HTTP 服务（GET / 探活，POST / 执行 ExtendScript）；
+  2. 加载 jsx/runtime.jsx，把 pymiere 需要的 ExtendScript 运行时注入 Premiere；
+  3. 把运行状态显示在面板上，便于排查。
+
+  安装：运行 scripts/install-premiere-bridge.ps1
+  （复制到 %APPDATA%\Adobe\CEP\extensions 并打开 PlayerDebugMode）。
+-->
+<ExtensionManifest Version="7.0" ExtensionBundleId="com.aipr.premiere.link"
+    ExtensionBundleVersion="1.0.0" ExtensionBundleName="aiPr Link"
+    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+
+    <ExtensionList>
+        <Extension Id="com.aipr.premiere.link.panel" Version="1.0.0" />
+    </ExtensionList>
+
+    <ExecutionEnvironment>
+        <HostList>
+            <!-- PPRO 13.0 = Premiere Pro 2019；99.9 覆盖未来版本（本机 26.0 已验证） -->
+            <Host Name="PPRO" Version="[13.0,99.9]" />
+        </HostList>
+        <LocaleList>
+            <Locale Code="All" />
+        </LocaleList>
+        <RequiredRuntimeList>
+            <RequiredRuntime Name="CSXS" Version="9.0" />
+        </RequiredRuntimeList>
+    </ExecutionEnvironment>
+
+    <DispatchInfoList>
+        <Extension Id="com.aipr.premiere.link.panel">
+            <DispatchInfo>
+                <Resources>
+                    <MainPath>./index.html</MainPath>
+                    <!-- 面板加载时自动把运行时注入 ExtendScript 全局 -->
+                    <ScriptPath>./jsx/runtime.jsx</ScriptPath>
+                    <CEFCommandLine>
+                        <Parameter>--enable-nodejs</Parameter>
+                        <Parameter>--mixed-context</Parameter>
+                        <Parameter>--allow-file-access</Parameter>
+                        <Parameter>--allow-file-access-from-files</Parameter>
+                    </CEFCommandLine>
+                </Resources>
+                <Lifecycle>
+                    <AutoVisible>true</AutoVisible>
+                </Lifecycle>
+                <UI>
+                    <Type>Panel</Type>
+                    <Menu>aiPr Link</Menu>
+                    <Geometry>
+                        <Size>
+                            <Height>240</Height>
+                            <Width>320</Width>
+                        </Size>
+                        <MinSize>
+                            <Height>160</Height>
+                            <Width>240</Width>
+                        </MinSize>
+                        <MaxSize>
+                            <Height>800</Height>
+                            <Width>900</Width>
+                        </MaxSize>
+                    </Geometry>
+                </UI>
+            </DispatchInfo>
+        </Extension>
+    </DispatchInfoList>
+</ExtensionManifest>

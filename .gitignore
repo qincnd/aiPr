@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+backend/.env
+
+# Node / 前端构建产物
+node_modules/
+frontend/dist/
+
+# 运行时产物（方案、日志、时间线快照、导出文件）
+workspace/
+
+# 素材目录：内容不入库，只保留目录本身
+media/*
+!media/.gitkeep
+
+# 编辑器
+.vscode/
+.idea/
+.DS_Store

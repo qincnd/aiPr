@@ -1,0 +1,9 @@
+# 真实控制 Adobe Premiere Pro 时安装（需要本机已安装 Premiere Pro）
+# pymiere 通过 CEP 面板与 Premiere Pro 通信；面板由本仓库提供：
+#   powershell -ExecutionPolicy Bypass -File scripts\install-premiere-bridge.ps1
+#
+# setuptools 是必需的：pymiere 仍在 import distutils.version，而 distutils 在 Python 3.12 已被移除，
+# setuptools 提供的兼容层能让它在 3.12+（含 3.14）上正常 import。
+-r requirements.txt
+pymiere>=1.4.0
+setuptools>=70

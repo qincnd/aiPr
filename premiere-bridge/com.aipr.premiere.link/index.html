@@ -1,0 +1,98 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <title>aiPr Link</title>
+    <style>
+      :root {
+        color-scheme: dark;
+      }
+      body {
+        margin: 0;
+        padding: 10px;
+        background: #1f2126;
+        color: #d8dce5;
+        font-family: "Segoe UI", "Microsoft YaHei", sans-serif;
+        font-size: 12px;
+      }
+      h1 {
+        margin: 0 0 8px;
+        font-size: 13px;
+        letter-spacing: 0.4px;
+      }
+      .row {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        margin-bottom: 6px;
+      }
+      .dot {
+        width: 8px;
+        height: 8px;
+        border-radius: 50%;
+        background: #8a8f9c;
+        flex: none;
+      }
+      .dot.ok {
+        background: #35c98b;
+      }
+      .dot.err {
+        background: #ef5b5b;
+      }
+      .muted {
+        color: #8b93a7;
+      }
+      code {
+        font-family: Consolas, monospace;
+        font-size: 11px;
+        color: #9fb0cc;
+        word-break: break-all;
+      }
+      #log {
+        margin-top: 8px;
+        max-height: 90px;
+        overflow: auto;
+        border-top: 1px solid #2b303b;
+        padding-top: 6px;
+      }
+      #log div {
+        margin-bottom: 3px;
+        color: #8b93a7;
+      }
+      #log div.error {
+        color: #ffb4b4;
+      }
+      ol {
+        margin: 6px 0 0;
+        padding-left: 16px;
+        color: #8b93a7;
+      }
+      ol li {
+        margin-bottom: 3px;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>aiPr Link</h1>
+
+    <div class="row">
+      <span class="dot" id="dot"></span>
+      <span id="status">正在启动本地服务…</span>
+    </div>
+    <div class="row muted">
+      地址：<code id="endpoint">127.0.0.1:3000</code>
+    </div>
+    <div class="row muted">
+      已处理请求：<code id="count">0</code>
+    </div>
+
+    <div id="log"></div>
+
+    <ol id="hint">
+      <li>保持这个面板处于打开状态，Python 才能驱动 Premiere。</li>
+      <li>如果状态不是绿色，请先关闭本面板再重新打开一次。</li>
+    </ol>
+
+    <script src="js/main.js"></script>
+  </body>
+</html>
