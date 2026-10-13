@@ -101,7 +101,18 @@ class TrackItem {
       displayName: 'Volume',
       properties: makeCollection('ComponentParamCollection', [levelParam]),
     }
-    defineGetter(this, 'components', () => makeCollection('ComponentCollection', [volumeComponent]))
+    this.effects = []
+    defineGetter(this, 'components', () =>
+      makeCollection('ComponentCollection', [
+        volumeComponent,
+        // 效果（addVideoEffect 之后真的多出一个组件，和真机一致）
+        ...this.effects.map((name) => ({
+          reflect: { name: 'Component' },
+          displayName: name,
+          properties: makeCollection('ComponentParamCollection', []),
+        })),
+      ]),
+    )
   }
 
   remove() {
@@ -118,14 +129,29 @@ class TrackItem {
   }
 }
 
+class TrackTransition {
+  constructor(name, startSeconds, durationSeconds) {
+    this.reflect = { name: 'Component' }
+    this.name = name
+    this.start = new Time(startSeconds)
+    this.end = new Time(startSeconds + durationSeconds)
+    this.duration = new Time(durationSeconds)
+  }
+}
+
 class Track {
   constructor(name, mediaType) {
     this.reflect = { name: 'Track' }
     this.name = name
     this.mediaType = mediaType
     this.items = []
+    this.transitionList = []
     defineGetter(this, 'clips', () =>
       makeCollection('TrackItemCollection', this.items.filter((item) => !item.removed)),
+    )
+    // 真机上转场挂在轨道上（TrackItem 上没有 transitions），这里照真机建模
+    defineGetter(this, 'transitions', () =>
+      makeCollection('TrackItemCollection', this.transitionList),
     )
   }
 
@@ -286,13 +312,149 @@ const app = {
   isDocumentOpen: () => true,
 }
 
+// QE 仿真：真机（PR 2026）的 QE 轨道要从 getActiveSequence() 上取，
+// item 是 Clip/Empty 交替的（第 k 个片段在索引 2k，所以序号定位不可靠），
+// addTransition 只认 3 个参数且对齐被选中片段的出点，razor 挂在轨道上。
+function qeTrack(sequence, kind, index) {
+  const track = kind === 'video' ? sequence.video[index] : sequence.audio[index]
+  const items = () =>
+    track.items.filter((item) => !item.removed).sort((a, b) => a.start.seconds - b.start.seconds)
+  // 真机的 QE item 列表里片段之间夹着 Empty 占位
+  const qeItems = () => {
+    const result = []
+    items().forEach((item) => {
+      result.push({ name: item.name, item })
+      result.push({ name: '', item: null })
+    })
+    return result
+  }
+  const trackProxy = {
+    reflect: { name: 'Track' },
+    get numItems() {
+      return qeItems().length
+    },
+    razor(timecode) {
+      const seconds = timecodeToSeconds(timecode)
+      const target = items().find(
+        (item) => seconds > item.start.seconds && seconds < item.end.seconds,
+      )
+      if (!target) {
+        return true
+      }
+      const outPoint = target.outPoint.seconds
+      const tailStart = seconds
+      const tail = new TrackItem(target.projectItem, tailStart)
+      tail.inPoint = new Time(target.inPoint.seconds + (seconds - target.start.seconds))
+      tail.outPoint = new Time(outPoint)
+      tail.end = new Time(tailStart + (outPoint - tail.inPoint.seconds))
+      target.end = new Time(seconds)
+      target.outPoint = new Time(tail.inPoint.seconds)
+      track.items.push(tail)
+      return true
+    },
+    getItemAt(position) {
+      const entry = qeItems()[position]
+      if (!entry) {
+        throw new Error('QE: no item at ' + position)
+      }
+      return {
+        reflect: { name: 'TrackItem' },
+        name: entry.name,
+        addTransition(transition, forceSingle, duration, extra) {
+          if (extra !== undefined) {
+            throw new Error('Illegal Parameter type')
+          }
+          const target = entry.item
+          if (!target || !transition || !transition.name) {
+            // 真机上给 Empty 位或无效转场对象加转场是静默失效
+            return true
+          }
+          track.transitionList.push(
+            // 真机的转场对齐「被选中片段的出点」
+            new TrackTransition(
+              transition.name,
+              target.end.seconds - resolveTransitionSeconds(duration),
+              resolveTransitionSeconds(duration),
+            ),
+          )
+          return true
+        },
+        addVideoEffect(effect, extra) {
+          if (extra !== undefined) {
+            throw new Error('Illegal Parameter type')
+          }
+          const target = entry.item
+          if (!target || !effect || !effect.name) {
+            return true
+          }
+          target.effects.push(effect.name)
+          return true
+        },
+      }
+    },
+  }
+  return trackProxy
+}
+
+function timecodeToSeconds(timecode) {
+  const match = /^(\d+):(\d+):(\d+):(\d+)$/.exec(String(timecode))
+  if (!match) {
+    return Number(timecode) || 0
+  }
+  const [, hours, minutes, seconds, frames] = match.map(Number)
+  return hours * 3600 + minutes * 60 + seconds + frames / 30
+}
+
+// QE 的 addTransition 签名在不同版本上不一样，仿真器只认得「时间码/秒数」这一类参数
+function resolveTransitionSeconds(...candidates) {
+  for (const candidate of candidates) {
+    if (candidate === undefined || candidate === null || typeof candidate === 'boolean') {
+      continue
+    }
+    const seconds = timecodeToSeconds(candidate)
+    if (seconds > 0) {
+      return seconds
+    }
+  }
+  return 1
+}
+
+// 真机上这两个 lookup 对不存在的名字不报错，只返回 name 为空的对象；
+// 效果名在中文版里是本地化的（"Lumetri 颜色"），转场则仍认英文内部名（"Cross Dissolve"）。
+const FAKE_EFFECTS = ['Lumetri 颜色', 'Gaussian Blur', '裁剪', '黑白']
+const FAKE_TRANSITIONS = ['交叉溶解（旧版）', 'Cross Dissolve', 'Dip to Black']
+
 const qe = {
   reflect: { name: 'QE' },
   project: {
-    getVideoTrackAt: () => ({ razor: () => true, addTransition: () => true, numItems: 0 }),
-    getAudioTrackAt: () => ({ razor: () => true, numItems: 0 }),
-    getVideoTransitionByName: () => ({ reflect: { name: 'VideoTransition' } }),
-    getVideoEffectByName: () => ({ reflect: { name: 'VideoEffect' } }),
+    // PR 2026 的 qe.project 上其实没有 getVideoTrackAt，写在这里只是为了暴露误用
+    getVideoTrackAt: () => {
+      throw new Error('qe.project.getVideoTrackAt 在 PR 2026 上不存在')
+    },
+    getActiveSequence: () => {
+      const sequence = project.activeSequence
+      return {
+        reflect: { name: 'Sequence' },
+        getVideoTrackAt: (index) => qeTrack(sequence, 'video', index),
+        getAudioTrackAt: (index) => qeTrack(sequence, 'audio', index),
+        // 整条时间线切割：PR 2026 上 QE 的 sequence 直接带 razor
+        razor: (timecode) => {
+          sequence.video.forEach((_, index) => qeTrack(sequence, 'video', index).razor(timecode))
+          sequence.audio.forEach((_, index) => qeTrack(sequence, 'audio', index).razor(timecode))
+          return true
+        },
+      }
+    },
+    getVideoEffectList: () => FAKE_EFFECTS.slice(),
+    getVideoTransitionList: () => FAKE_TRANSITIONS.slice(),
+    getVideoTransitionByName: (name) => ({
+      reflect: { name: 'VideoTransition' },
+      name: FAKE_TRANSITIONS.indexOf(String(name)) >= 0 ? String(name) : '',
+    }),
+    getVideoEffectByName: (name) => ({
+      reflect: { name: 'VideoEffect' },
+      name: FAKE_EFFECTS.indexOf(String(name)) >= 0 ? String(name) : '',
+    }),
   },
 }
 

@@ -7,8 +7,9 @@
 3. 把方案翻译成对 **Premiere Pro** 的一连串操作，实时把日志推给前端。
 
 > 当前是**框架版**：分层、接口、DSL、Mock 后端、前后端、测试、文档都已就位；
-> 真实控制链路（pymiere + 自研 CEP 面板）已实现，并通过「假 CEP 宿主仿真器」跑通全部适配器逻辑，
-> 真机上的最后一步是在 Premiere 里打开面板（见 [premiere-integration.md](docs/premiere-integration.md)）。
+> 真实控制链路（pymiere + 自研 CEP 面板）**已在 Premiere Pro 2026（26.0.0.72，中文界面）真机上逐条验证**：
+> 建序列/追加/插入/移动/修剪/切割/转场/效果/标记/快照全部实测可用
+> （完整步骤与 PR 2026 的 QE 实测结论见 [premiere-integration.md](docs/premiere-integration.md)）。
 
 ## 已经能跑
 
@@ -17,10 +18,13 @@
 * 后端：素材扫描/白名单校验、方案生成（大模型 + 启发式兜底）、任务队列（串行、可取消）、
   产物落盘、`/docs` 自动 API 文档；
 * 剪辑 DSL：13 种操作（建序列、追加/插入/移动/修剪片段、切割、删区间、转场、效果、音量、
-  标记、导出），5 个测试模块共 **47 个用例全部通过**；
+  标记、导出），5 个测试模块共 **51 个用例全部通过**；
 * Mock 后端：内存时间线，导出时额外产出**可直接导入 Premiere 的 EDL** 与时间线快照 JSON；
 * 真实后端：`pymiere` + 自研 CEP 面板（[premiere-bridge/](premiere-bridge/)）驱动本机 Premiere Pro，
   另有 **2 个脱离 Premiere 的自测脚本**（协议自测 + 适配器自测，带 Premiere 对象模型仿真器）。
+
+真机实测（30 条操作的完整任务，`AI Sequence`：15 个片段 + 14 个转场 + 效果）：**30/30 条操作成功**，
+转场逐个落在剪辑点上、效果真的挂到片段组件上，时间线快照可完整回读。
 
 ## 目录结构
 
@@ -100,6 +104,9 @@ cd frontend; npm run dev     # http://localhost:5173，/api 已代理到 8000
 [docs/premiere-integration.md](docs/premiere-integration.md)）：
 
 ```powershell
+#配置虚拟环境
+python -m venv .venv
+.venv\Scripts\activate
 # 1) 装 Python 依赖（含 pymiere 与 setuptools）
 .\.venv\Scripts\python.exe -m pip install -r backend\requirements-premiere.txt
 
@@ -161,7 +168,7 @@ cd backend; ..\.venv\Scripts\python.exe -m uvicorn app.main:app --reload
 ## 测试
 
 ```powershell
-# 单元测试（47 个用例）
+# 单元测试（51 个用例）
 cd backend; ..\.venv\Scripts\python.exe -m pytest; cd ..
 
 # 真实链路自测（不需要装 Premiere）

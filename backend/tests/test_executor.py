@@ -173,6 +173,28 @@ async def test_create_sequence_failure_is_fatal_even_when_continuing(setup):
     assert any("不再执行" in message for _, message in collector.events)
 
 
+async def test_sequence_spec_mismatch_is_reported_as_warning(setup):
+    """真实后端按参照素材建序列时规格会被素材带跑，必须让用户在事件流里看到。"""
+
+    _, library, _, collector, executor = setup
+    plan = build_plan([library.assets[0].id, library.assets[1].id])
+
+    def smaller(spec, reference_assets=None):
+        # 适配器方法是被 asyncio.to_thread 调用的，这里必须是同步函数
+        timeline = original(spec, reference_assets)
+        return timeline.model_copy(update={"width": 1280, "height": 720, "fps": 29.97})
+
+    original = executor.adapter.create_sequence
+    executor.adapter.create_sequence = smaller  # type: ignore[method-assign]
+    result = await executor.run(plan, library=library)
+
+    warnings = [message for level, message in collector.events if level is EventLevel.WARNING]
+    assert any("1280x720@29.97fps" in message and "1920x1080@30fps" in message for message in warnings), (
+        collector.messages()
+    )
+    assert result.success is True
+
+
 async def test_dry_run_skips_export(setup):
     _, library, _, collector, executor = setup
     plan = build_plan([library.assets[0].id, library.assets[1].id])

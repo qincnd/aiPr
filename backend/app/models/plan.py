@@ -136,7 +136,7 @@ class DeleteRangeOp(OperationBase):
 
 class ApplyTransitionOp(OperationBase):
     op: Literal[OperationType.APPLY_TRANSITION]
-    at: float = Field(description="转场中心时刻（秒）")
+    at: float = Field(description="剪辑点时刻（秒），转场落在该剪辑点上")
     track: str = Field(default="V1", pattern=TRACK_PATTERN)
     transition: str = Field(default="cross_dissolve", description="cross_dissolve / dip_to_black / wipe ...")
     duration: float = Field(default=1.0, description="转场时长（秒）")

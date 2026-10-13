@@ -275,6 +275,28 @@ class PlanExecutor:
             op=operation.op.value,
             data={"timeline": timeline.model_dump() if timeline else None},
         )
+        mismatch = self._spec_mismatch(spec, timeline)
+        if mismatch:
+            # 后端按素材规格建序列时规格会被素材带跑，必须让用户在界面上看得见
+            await self.emit(
+                EventLevel.WARNING,
+                mismatch,
+                op_index=index,
+                op=operation.op.value,
+            )
+
+    @staticmethod
+    def _spec_mismatch(spec: SequenceSpec, timeline: TimelineState | None) -> str | None:
+        if timeline is None or not timeline.width or not timeline.height:
+            return None
+        actual = f"{timeline.width:g}x{timeline.height:g}@{timeline.fps:g}fps"
+        wanted = spec.label
+        if actual == wanted:
+            return None
+        return (
+            f"序列实际规格是 {actual}，与方案要求的 {wanted} 不一致"
+            "（真实 Premiere 是按参照素材的规格建序列的；要严格指定请在 create_sequence 里填 preset）"
+        )
 
     def _reference_assets(self) -> list[MediaAsset]:
         """方案里会用到的视频素材（最多取前几个），给真实后端当建序列的规格参照。"""

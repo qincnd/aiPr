@@ -108,8 +108,13 @@ def main() -> int:
 
         video_a = make_asset("clip_a.mp4", 8.0)
         video_b = make_asset("clip_b.mp4", 6.0)
-        names = adapter.import_media([video_a, video_b], "aiPr 素材")
-        report("import_media 回查素材名", names == ["clip_a.mp4", "clip_b.mp4"], str(names))
+        audio = make_asset("music.wav", 30.0, kind="audio")
+        names = adapter.import_media([video_a, video_b, audio], "aiPr 素材")
+        report(
+            "import_media 回查素材名",
+            names == ["clip_a.mp4", "clip_b.mp4", "music.wav"],
+            str(names),
+        )
 
         spec = SequenceSpec(name="SelfTest Sequence", width=1920, height=1080, fps=30.0)
         timeline = adapter.create_sequence(spec)
@@ -134,8 +139,24 @@ def main() -> int:
         report("trim_clip 时长变 1.5s", abs((trimmed.end - trimmed.start) - 1.5) < 0.02,
                f"{trimmed.start:.2f} → {trimmed.end:.2f}")
 
-        adapter.set_volume(second, db=-6.0)
-        report("set_volume 写进 Volume 组件", True)
+        audio_clip = adapter.append_clip(
+            audio, ref="music", track="A1", in_point=0.0, out_point=10.0
+        )
+        adapter.set_volume(audio_clip, db=-6.0)
+        volume_component = next(
+            component
+            for component in adapter._native_clip(audio_clip).components
+            if str(getattr(component, "displayName", "")).lower() == "volume"
+        )
+        level = next(
+            prop for prop in volume_component.properties
+            if str(getattr(prop, "displayName", "")).lower() == "level"
+        )
+        report(
+            "set_volume 在 A1 音频片段写入 Volume/Level",
+            level.getValue() == -6.0,
+            str(level.getValue()),
+        )
 
         adapter.add_marker(at=1.5, name="看点", color="red", duration=0.5)
         snapshot = adapter.snapshot()
@@ -153,6 +174,47 @@ def main() -> int:
             str(snapshot.track("V2").clips[0].start),
         )
         report("时间线总轨道数", len(snapshot.tracks) == 4, str(len(snapshot.tracks)))
+
+        # QE 链路：切割 / 转场 / 效果（都依赖 getActiveSequence() 的 QE 轨道）
+        adapter.razor(at=4.0, track="V1")
+        # 转场对齐「被选中片段的出点」，所以这里传的是剪辑点 4.0（3.0-4.0 与 4.0-6.0 之间）
+        adapter.apply_transition(at=4.0, track="V1", transition="cross_dissolve", duration=0.5)
+        adapter.apply_effect(second, effect="Lumetri Color", params={})
+
+        qe_snapshot = adapter.snapshot()
+        report(
+            "snapshot 能读出轨道上的转场",
+            len(qe_snapshot.transitions) == 1
+            and qe_snapshot.transitions[0].transition == "Cross Dissolve"
+            and abs(qe_snapshot.transitions[0].at - 3.5) < 0.01,
+            str([(t.track, t.at, t.transition, t.duration) for t in qe_snapshot.transitions]),
+        )
+        report(
+            "转场时长按方案值记录",
+            bool(qe_snapshot.transitions)
+            and abs(qe_snapshot.transitions[0].duration - 0.5) < 0.01,
+            str(qe_snapshot.transitions[0].duration if qe_snapshot.transitions else None),
+        )
+        report(
+            "效果按别名解析并真的挂到片段上（Lumetri Color → Lumetri 颜色）",
+            adapter._clip_has_component(second, "Lumetri 颜色"),
+            str(adapter._component_names(second)),
+        )
+        report(
+            "snapshot 能读回片段效果",
+            any(effect.effect == "Lumetri 颜色" for effect in qe_snapshot.effects),
+            str([(effect.clip_id, effect.effect) for effect in qe_snapshot.effects]),
+        )
+        report(
+            "razor 把 V1 切成 3 段",
+            len(qe_snapshot.track("V1").clips) == 3,
+            str([(c.name, c.start, c.end) for c in qe_snapshot.track("V1").clips]),
+        )
+        try:
+            adapter.apply_effect(second, effect="不存在的效果", params={})
+            report("未知效果会报错", False, "没有抛异常")
+        except Exception as error:  # noqa: BLE001
+            report("未知效果会报错", "没有名为" in str(error), str(error)[:80])
 
         # 预设解析：仿真器的 app.path 指向真实的 Premiere 安装目录
         preset = adapter._resolve_sequence_preset(SequenceSpec(name="p", width=1920, height=1080, fps=25.0))

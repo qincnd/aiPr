@@ -81,30 +81,61 @@ cd backend; ..\.venv\Scripts\python.exe -m uvicorn app.main:app --reload
 | `track.insertClip()` 返回 None | pymiere 的 `Track.insertClip` 是无返回值包装，ExtendScript 侧本身也是 void | 插入后按起点时间在轨道上把片段找回来 |
 | `Marker.end` 写入后再读会抛异常 | getter 返回 `Time`，setter 却要 `float`，写回后再读就崩 | 用防御性读取 `_safe_seconds()` |
 | 遍历 `sequence.markers` 报错 | pymiere 的 `MarkerCollection` 没实现 `__iter__`/`__getitem__` | 退化成 `getFirstMarker()`/`getLastMarker()`，读不到时只记日志 |
-| `createNewSequenceFromClips` 后时间线里凭空多了片段 | 这个接口会把传入的素材**真的插进序列** | 优先用预设建空序列；降级到它时先把自动插入的片段清掉 |
-| 序列预设传空串会弹对话框 | `createNewSequence(name, presetPath)` 需要真实存在的 `.sqpreset` | 扫描 `Settings\SequencePresets` 按分辨率/帧率/横竖屏打分挑选 |
+| `createNewSequenceFromClips` 后时间线里凭空多了片段 | 这个接口会把传入的素材**真的插进序列** | 默认用它按参照素材建序列，随后清除自动插入的片段；方案显式提供 `preset` 时才走预设路径 |
+| `createNewSequence(name, presetPath)` 会弹对话框或阻塞 | 必须传真实存在的 `.sqpreset`；传错误/空路径可能让对话框挡住后续 ExtendScript | 按分辨率/帧率/横竖屏扫描 `Settings\SequencePresets` 自动挑选，并给 `_eval` 加超时保护 |
+| Premiere 界面被弹窗挡住后，后续所有脚本调用永久卡住 | `createNewSequence` 会弹「新建序列」对话框，而对话框阻塞 ExtendScript 引擎 | 默认改走 `createNewSequenceFromClips([一个素材])`（不弹窗、规格天然匹配素材）再清空；所有 `_eval` 都带超时，超时抛出「可能弹了对话框」的可操作错误 |
+| QE 的 `addTransition` 加转场「成功」但时间线上没有转场 | QE 轨道的 item 是 **Clip/Empty 交替** 的（第 k 个片段在索引 2k），按序号定位会打到空 item 上；空 item 上调用是静默失效 | 不再用序号定位，改成在 JS 里**按片段名 + 出现次序**扫描 QE item |
+| QE 的 `addTransition` 抛 `Illegal Parameter type` | 可用签名只有 `addTransition(transition, forceSingle, durationTimecode)` 三个参数，多传一个（哪怕是 `0`）就报错；`forceSingle=true` 会把转场拉满整段长度，不能用 | 只传三个参数，`forceSingle` 固定 `false`，时长用序列时间码 |
+| 转场加到了错误的剪辑点 | `addTransition` 对齐的是**被选中片段的出点**，不是入点 | 在剪辑点 C 处加转场时，选「结束于 C 的那个片段」 |
+| `getVideoEffectByName('Lumetri Color')` 不报错但加不上效果 | 名字不存在时它只返回一个 **`name` 为空的对象**（不抛异常），拿它去 `addVideoEffect` 是静默无操作 | 先按官方列表解析真实名字：`getVideoEffectList()`/`getVideoTransitionList()` + 别名表 + 归一化模糊匹配；调用后再回读类型化 API（组件数/转场数）确认真的生效，否则抛错 |
+| 效果名 / 参数名和文档对不上 | 中文版 Premiere 的效果名是**本地化**的（`Lumetri 颜色`、`裁剪`、`黑白`），组件参数也只有本地化 `displayName`（`曝光`、`对比度`） | 效果名走别名表（`EFFECT_ALIASES`）+ 列表模糊匹配；参数匹配不上时在日志里列出该效果的可用参数名 |
+
+## Premiere 2026（26.0）真机上实测到的行为
+
+这些结论是在本机 PR 2026 / 26.0.0.72 + 中文界面下逐条验证出来的：
+
+* **QE 只能从 ExtendScript 里原生调用**。pymiere 把 QE 包成 `PymiereGenericObject`，靠 `reflect` 查方法名，
+  而 QE 对象上查不到这些方法；另外 `qe.project` 上**没有** `getVideoTrackAt`，轨道必须从
+  `qe.project.getActiveSequence().getVideoTrackAt(i)` 取。
+* **QE 轨道的 item 是 Clip/Empty 交替的**：`numItems` 是片段数的两倍，第 k 个片段在索引 `2k`，
+  索引 `2k+1` 是占位空 item。所以「按序号定位片段」在这个版本上是不可靠的。
+* **转场**：`item.addTransition(transition, false, "00:00:00:15")`（三参数）——
+  转场落在**该片段的出点**上；`forceSingle=true` 会让转场长度变成整段片段时长。
+* **效果**：`item.addVideoEffect(effect)` 是两参数（多传 `0` 就报 `Illegal Parameter type`）；
+  加载后的组件名和参数名都是**界面语言**。
+* **音量**：Volume/Level 组件在音频片段上；V 轨视频片段没有该组件。中文版名称是「音量 / 级别」。
+  `set_volume` 应引用 A1 等音频轨上的音频片段。
+* **切割**：轨道级 `track.razor(timecode)`，整条时间线 `sequence.razor(timecode)`；
+  QE 片段的 `start/end` 是 `QETime`（读不出秒数），所以片段定位都在 Python 侧用类型化 API 算好。
+* **转场/效果读回**：转场挂在 **`Track.transitions`** 上（`TrackItem.transitions` 是 `undefined`），
+  与片段一起在快照里回读；片段效果从 `clip.components` 里回读并过滤掉
+  Premiere 自带的 `运动`/`不透明度`/`Volume` 组件。
+* **序列规格**：`createNewSequenceFromClips` 建出来的序列规格跟参照素材走，
+  所以方案里写的 `1920x1080@30` 可能实际是 `1280x720@29.97`——执行器会在事件流里给出警告，
+  要强制指定请给 `create_sequence` 填 `preset`。
+* **导出**：`project.encoder.encodeSequence(...)` 的预设参数必须是真实存在的 `.epr` 文件，
+  不填就只会在工程里加一条导出任务或直接失败；`export_sequence` 因此仍是「需要预设文件」。
 
 ## 操作 → API 对照与成熟度
 
 | 操作 | 实现方式 | 成熟度 |
 | --- | --- | --- |
 | `import_media` | 原生 `app.project.importFiles(...)`，再按 `mediaPath` 回查 ProjectItem | 原生 |
-| `create_sequence` | `project.createNewSequence(name, 预设路径)`，预设自动挑选 | 原生 |
+| `create_sequence` | 默认用参照素材 `createNewSequenceFromClips` + 清空（不弹窗）；给了 `preset` 才走 `createNewSequence(name, 预设路径)` | 原生 |
 | `append_clip` / `insert_clip` | `track.insertClip(projectItem, Time)` + 按起点找回片段 + 写 in/out | 原生 |
 | `move_clip` | `pymiere.wrappers.move_clip(clip, delta)` | 视版本（跨轨道做不到，会告警） |
 | `trim_clip` | 写 `inPoint/outPoint/start/end`（Time） | 原生 |
 | `add_marker` | `sequence.markers.createMarker(seconds)` + 写 `name/end` | 原生 |
-| `set_volume` | 遍历 `clip.components` 找 Volume → Level 参数 `setValue(db)` | 视版本 |
-| `razor` | QE `qe.project.getVideoTrackAt(i).razor(timecode)` | 视版本 |
+| `set_volume` | 在音频片段上找「音量 / 级别」组件与参数并调用 `setValue(db)`；要放在 A 轨音频片段上 | PR 2026 已验证 |
+| `razor` | QE `sequence.razor(timecode)` / `track.razor(timecode)` | 原生（PR 2026 已验证） |
 | `delete_range` | 边界裁剪 + `TrackItem.remove()`，必要时借 QE 切两刀 | 视版本 |
-| `apply_transition` | QE `getVideoTransitionByName()` + `track.addTransition(...)` | 视版本（签名随版本变化） |
-| `apply_effect` | QE `getVideoEffectByName()` + `clip.addVideoEffect()`，参数按显示名匹配 | 视版本 |
+| `apply_transition` | QE `getVideoTransitionByName()` + `item.addTransition(tr, false, timecode)`（对齐片段出点） | 原生（PR 2026 已验证） |
+| `apply_effect` | QE `getVideoEffectByName()` + `item.addVideoEffect()`，名字先按官方列表解析成本地化名称 | 原生（PR 2026 已验证） |
 | `export_sequence` | `project.encoder.encodeSequence(...)`，**必须**填 `.epr` 预设路径 | 需要预设文件 |
 
 「视版本」的几条走 QE（Adobe 未公开文档、签名随版本变化），失败时会抛出带原因的 `PremiereError`
 并继续执行后续操作。`GET /api/system` 的 `premiere.capabilities` 会返回每个操作的成熟度
 （native / partial / simulated），前端顶栏据此显示可用性。
-
 ## 其他接入方式
 
 * **自研 CEP 面板**：就是本仓库的做法（见上文）；换协议只改 `js/main.js` 与 `PremiereAdapter` 实现。

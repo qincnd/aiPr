@@ -20,8 +20,14 @@
 * ``project.createNewSequence(name, presetPath)`` 的第二个参数必须是**真实存在的 .sqpreset 路径**
   （传空串会弹新建序列对话框）；没有素材可参照时，这里按分辨率/帧率自动挑一个系统预设。
 * 跨轨道移动片段在 ExtendScript API 里做不到（只有 QE 能做），因此 ``move_clip`` 忽略 track 参数并告警。
-* 转场 / 效果 / 切割只能走 QE（该 API 在不同 PR 版本上签名不一致），属于尽力而为，
-  ``capabilities()`` 里标成 partial，失败时抛出带原因的 PremiereError。
+* 转场 / 效果 / 切割只能走 QE（该 API 在不同 PR 版本上签名不一致）：
+  - ``addTransition`` 只认 ``addTransition(transition, forceSingle, durationTimecode)`` 三个参数，
+    且转场对齐「被选中片段的出点」→ 要在剪辑点 C 加转场必须选结束于 C 的片段；
+  - QE 轨道的 item 是 Clip/Empty 交替的（第 k 个片段在索引 2k），所以只能按片段名定位；
+  - ``getVideoEffectByName`` / ``getVideoTransitionByName`` 对不存在的名字不报错、只返回 name 为空的对象，
+    调用后必须回读类型化 API 确认真的生效（转场数、组件数）；
+  - 中文版 Premiere 的效果名是本地化的（"Lumetri 颜色"、"裁剪"），这里用官方列表 + 别名表做解析。
+  ``capabilities()`` 里仍标成 partial，失败时抛出带原因的 PremiereError。
 """
 
 from __future__ import annotations
@@ -35,7 +41,15 @@ from app.core.errors import PremiereError, PremiereUnavailableError
 from app.core.logging import get_logger
 from app.models.media import MediaAsset, MediaKind
 from app.models.plan import SequenceSpec
-from app.models.timeline import ClipHandle, TimelineClip, TimelineMarker, TimelineState, TimelineTrack
+from app.models.timeline import (
+    ClipHandle,
+    TimelineClip,
+    TimelineEffect,
+    TimelineMarker,
+    TimelineState,
+    TimelineTrack,
+    TimelineTransition,
+)
 
 from .base import PremiereAdapter, PremiereStatus
 
@@ -62,12 +76,66 @@ TRANSITION_NAMES = {
     "page_peel": "Page Peel",
 }
 
+#: 效果名在中文版 Premiere 上是中英混排的（Lumetri 颜色 / Gaussian Blur / 裁剪），
+#: 这里把常用的英文名映射到本机真实存在的名字；解析时还会去官方列表里做模糊匹配。
+EFFECT_ALIASES: dict[str, tuple[str, ...]] = {
+    "lumetri color": ("Lumetri 颜色",),
+    "lumetri": ("Lumetri 颜色",),
+    "crop": ("裁剪",),
+    "black & white": ("黑白", "Black & White"),
+    "black and white": ("黑白",),
+    "sharpen": ("锐化",),
+    "transform": ("变换",),
+    "color balance rgb": ("颜色平衡 (RGB)",),
+    "color balance (rgb)": ("颜色平衡 (RGB)",),
+    "color balance hls": ("颜色平衡 (HLS)",),
+    "levels": ("色阶",),
+    "mirror": ("镜像",),
+    "invert": ("反转",),
+    "tint": ("色彩",),
+    "drop shadow": ("投影",),
+    "text": ("文本",),
+    "timecode": ("时间码",),
+    "video limiter": ("视频限制器",),
+    "lens distortion": ("镜头扭曲",),
+    "fast blur": ("快速模糊",),
+    "unsharp mask": ("钝化蒙版",),
+    "warp stabilizer": ("变形稳定器",),
+    "ultra key": ("超级键",),
+    "chroma key": ("色度键",),
+    "track matte key": ("轨道遮罩键",),
+    "turbulent displace": ("湍流置换",),
+    "twirl": ("旋转扭曲",),
+    "spherize": ("球面化",),
+    "roughen edges": ("粗糙边缘",),
+    "posterize time": ("抽帧",),
+    "echo": ("残影",),
+    "find edges": ("查找边缘",),
+    "lens flare": ("镜头光晕",),
+    "lighting effects": ("光照效果",),
+    "basic 3d": ("基本 3D",),
+    "alpha adjust": ("Alpha 调整",),
+    "extract": ("提取",),
+    "garbage matte 4 point": ("4 点无用信号遮罩",),
+    "4-point garbage matte": ("4 点无用信号遮罩",),
+    "auto reframe": ("自动重构",),
+    "gaussian blur": ("Gaussian Blur", "高斯模糊（旧版）"),
+    "directional blur": ("Directional Blur",),
+    "vignette": ("Vignette",),
+    "mosaic": ("Mosaic", "马赛克（旧版）"),
+    "brightness & contrast": ("Brightness & Contrast",),
+}
+
 PORTRAIT_TOKENS = ("portrait", "9x16", "4x5", "vertical")
 SQUARE_TOKENS = ("square", "1x1")
 NOISY_TOKENS = ("hdr", "proxy", "anamorphic", "vr", "360", "mono", "multicam", "trial", "legacy", "hdv")
 
 PROJECT_ITEM_TYPE_BIN = 2
 MIN_CLIP_SECONDS = 0.05
+
+#: Premiere 每个片段自带的基础组件，不算「我们加的效果」
+BUILTIN_COMPONENT_MATCHES = ("AE.ADBE Opacity", "AE.ADBE Motion")
+BUILTIN_COMPONENT_NAMES = {"volume", "音量", "opacity", "不透明度", "motion", "运动"}
 
 INSTALL_HINT = (
     "无法连接 Premiere Pro。请依次确认："
@@ -92,6 +160,8 @@ class PymierePremiereAdapter(PremiereAdapter):
         self._clip_registry: dict[str, Any] = {}
         self._handles: dict[str, ClipHandle] = {}
         self._imported_assets: dict[str, MediaAsset] = {}
+        self._effect_catalog: list[str] | None = None
+        self._transition_catalog: list[str] | None = None
 
     # ---------------------------------------------------------------- 连接
     def _lib(self) -> Any:
@@ -180,8 +250,8 @@ class PymierePremiereAdapter(PremiereAdapter):
             "trim_clip": "native",
             "razor": "partial",
             "delete_range": "partial",
-            "apply_transition": "partial",
-            "apply_effect": "partial",
+            "apply_transition": "native",
+            "apply_effect": "native",
             "set_volume": "partial",
             "add_marker": "native",
             "export_sequence": "native",
@@ -196,6 +266,8 @@ class PymierePremiereAdapter(PremiereAdapter):
         self._clip_registry.clear()
         self._handles.clear()
         self._imported_assets.clear()
+        self._effect_catalog = None
+        self._transition_catalog = None
 
     # ---------------------------------------------------------------- 时间工具
     def _time(self, seconds: float) -> Any:
@@ -782,25 +854,22 @@ class PymierePremiereAdapter(PremiereAdapter):
     def razor(self, *, at: float, track: str | None) -> None:
         """QE 的 razor 需要时间码字符串。
 
-        注意：QE 必须用**原生 ExtendScript** 调用——pymiere 的 QE 是 PymiereGenericObject，
-        它靠 ExtendScript 的 reflect 查方法名，而 QE 对象上查不到 `getVideoTrackAt`（真机实测）。
+        注意（PR 2026 实测）：QE 必须用原生 ExtendScript 调——pymiere 的 QE 是 PymiereGenericObject，
+        靠 reflect 查方法名；而且 PR 2026 的 QE 里 **没有** ``qe.project.getVideoTrackAt``，
+        轨道要从 ``getActiveSequence()`` 上取，整条时间线切割则直接用 ``sequence.razor()``。
         """
 
-        sequence = self._sequence_or_fail()
         timecode = self._escaped(self._timecode(at))
+        self._assert_sequence_active()
+        script = (
+            f"{self._qe_track_expr(track)}.razor({timecode});"
+            if track
+            else f"qe.project.getActiveSequence().razor({timecode});"
+        )
         try:
-            if track:
-                self._eval(f"{self._qe_track_expr(track)}.razor({timecode});", timeout=30.0)
-                return
-            script = (
-                "var _seq = app.project.activeSequence;var _i = 0;"
-                f"for (_i = 0; _i < _seq.videoTracks.numTracks; _i++) {{ qe.project.getVideoTrackAt(_i).razor({timecode}); }}"
-                f"for (_i = 0; _i < _seq.audioTracks.numTracks; _i++) {{ qe.project.getAudioTrackAt(_i).razor({timecode}); }}"
-            )
             self._eval(script, timeout=60.0)
         except Exception as exc:
             raise PremiereError(f"切割失败（{at:.2f}s）：{exc}") from exc
-        _ = sequence
 
     def delete_range(self, *, start: float, end: float, track: str | None, ripple: bool) -> None:
         if end <= start:
@@ -842,48 +911,73 @@ class PymierePremiereAdapter(PremiereAdapter):
             self.razor(at=at, track=track)
         except PremiereError as exc:
             logger.warning("区间落在片段内部，但切割失败（%s）：%s", track, exc)
-
     def apply_transition(self, *, at: float, track: str, transition: str, duration: float) -> None:
         """加转场。
 
-        QE 必须用原生 ExtendScript 调（pymiere 的 QE 泛型对象查不到方法名），
-        而且 addTransition 的签名在不同版本间有差异，所以脚本里依次尝试常见顺序。
+        真机结论（PR 2026 实测，别再改回去）：
+
+        * ``addTransition`` 挂在 **QE 的片段对象** 上，可用签名是
+          ``addTransition(transition, forceSingle, durationTimecode)``——
+          多传一个参数就会抛 “Illegal Parameter type”，而 ``forceSingle=true`` 会把转场拉到整段长度；
+        * 转场**对齐被选中片段的出点**，所以要在剪辑点 C 处加转场，得选「结束于 C 的那个片段」；
+        * QE 轨道的 item 是 **Clip/Empty 交替** 的（第 k 个片段在索引 2k），按序号定位会打到空 item 上，
+          于是只能在 JS 里**按片段名 + 出现次序**扫描定位。
         """
 
-        preset_name = TRANSITION_NAMES.get(transition, transition)
+        preset_name = self._resolve_transition_name(transition)
         name_literal = self._escaped(preset_name)
-        start_timecode = self._escaped(self._timecode(max(0.0, at - duration / 2)))
         duration_timecode = self._escaped(self._timecode(duration))
+        clip_name, occurrence = self._locator_for_cut(track, at)
+        before = len(self._collect_transitions(self._track(track), track))
         script = (
-            f"var _trans = qe.project.getVideoTransitionByName({name_literal});"
-            f"if (!_trans) {{ throw new Error('Premiere 里没有名为 ' + {name_literal} + ' 的转场'); }}"
-            f"var _tr = {self._qe_track_expr(track)};"
-            f"try {{ _tr.addTransition(_trans, false, 0, {start_timecode}, {duration_timecode}); }}"
-            f"catch (_err) {{ _tr.addTransition(_trans, false, {start_timecode}, {duration_timecode}); }}"
+            f"{self._qe_locator_script(track)}"
+            f"var _aiprTrans = qe.project.getVideoTransitionByName({name_literal});"
+            f"if (!_aiprTrans || _aiprTrans.name === '') {{"
+            f"  throw new Error('Premiere 里没有名为 ' + {name_literal} + ' 的转场（请用 Premiere 里的显示名）'); }}"
+            f"var _aiprItem = _aiprLocate({self._escaped(clip_name)}, {occurrence});"
+            f"_aiprItem.addTransition(_aiprTrans, false, {duration_timecode});"
         )
         try:
             self._eval(script, timeout=40.0)
         except Exception as exc:
             raise PremiereError(f"添加转场失败（{preset_name}）：{exc}") from exc
 
+        after = len(self._collect_transitions(self._track(track), track))
+        if after <= before:
+            raise PremiereError(
+                f"转场没有真正落到 {track} 轨的 {at:.2f}s 上（Premiere 接受了调用但没有生成转场）。"
+                "多半是该时间点不是片段之间的剪辑点，请先确认片段位置"
+            )
+
     def apply_effect(self, handle: ClipHandle, *, effect: str, params: dict) -> None:
-        name_literal = self._escaped(effect)
+        """加效果。
+
+        ``getVideoEffectByName`` 对不存在的名字**不会报错**，只会返回一个 name 为空的对象，
+        拿它去 ``addVideoEffect`` 会静默失效——所以这里先按官方列表把名字解析成本机真实名字，
+        加完再用类型化 API 检查组件是否真的多了一个。
+        """
+
+        resolved = self._resolve_effect_name(effect)
+        name_literal = self._escaped(resolved)
+        clip_name, occurrence = self._locator_at_time(handle.track, handle.start)
         script = (
-            f"var _effect = qe.project.getVideoEffectByName({name_literal});"
-            f"if (!_effect) {{ throw new Error('Premiere 里没有名为 ' + {name_literal} + ' 的效果'); }}"
-            f"var _tr = {self._qe_track_expr(handle.track)};"
-            "var _target = null;"
-            "for (var _i = 0; _i < _tr.numItems; _i++) {"
-            "  var _item = _tr.getItemAt(_i);"
-            f"  if (Math.abs(_item.start.seconds - {handle.start}) < 0.05) {{ _target = _item; break; }}"
-            "}"
-            f"if (_target === null) {{ throw new Error('QE 里找不到起点在 {handle.start:.2f}s 的片段'); }}"
-            "_target.addVideoEffect(_effect);"
+            f"{self._qe_locator_script(handle.track)}"
+            f"var _aiprEffect = qe.project.getVideoEffectByName({name_literal});"
+            f"if (!_aiprEffect || _aiprEffect.name === '') {{"
+            f"  throw new Error('Premiere 里没有名为 ' + {name_literal} + ' 的效果'); }}"
+            f"var _aiprItem = _aiprLocate({self._escaped(clip_name)}, {occurrence});"
+            f"_aiprItem.addVideoEffect(_aiprEffect);"
         )
         try:
             self._eval(script, timeout=40.0)
         except Exception as exc:
             raise PremiereError(f"添加效果失败（{effect}）：{exc}") from exc
+
+        if not self._clip_has_component(handle, resolved):
+            raise PremiereError(
+                f"效果 {resolved} 没有真的加到片段上（Premiere 接受了调用但没有生成组件）。"
+                f"可用参数名：{'、'.join(self._component_names(handle)) or '无'}"
+            )
 
         if not params:
             return
@@ -891,8 +985,190 @@ class PymierePremiereAdapter(PremiereAdapter):
         missing = [key for key in params if key not in applied]
         if missing:
             logger.warning(
-                "效果 %s 上没找到这些参数（已按显示名匹配）：%s", effect, "、".join(missing)
+                "效果 %s 上没找到这些参数：%s（本机 Premiere 的参数名是本地化的，"
+                "当前可用：%s）",
+                resolved,
+                "、".join(missing),
+                "、".join(self._property_names(handle))[:200] or "无",
             )
+
+    # ---------------------------------------------------------------- QE 定位
+    def _qe_locator_script(self, track: str) -> str:
+        """生成 JS 片段：拿到 QE 轨道，并定义按「片段名 + 出现次序」定位 item 的 ``_aiprLocate``。
+
+        QE 轨道的 item 里夹杂着 Empty 占位（第 k 个片段在索引 2k），序号定位不可靠，只能按名字扫描。
+        """
+
+        return (
+            f"var _aiprTrack = {self._qe_track_expr(track)};"
+            "var _aiprLocate = function (want, occ) {"
+            "  var seen = 0;"
+            "  for (var i = 0; i < _aiprTrack.numItems; i++) {"
+            "    var got = '';"
+            "    try { got = _aiprTrack.getItemAt(i).name; } catch (e) { got = ''; }"
+            "    if (got === want) {"
+            "      if (seen === occ) { return _aiprTrack.getItemAt(i); }"
+            "      seen++;"
+            "    }"
+            "  }"
+            "  throw new Error('QE 里找不到片段 ' + want + '（第 ' + (occ + 1) + ' 个）');"
+            "};"
+        )
+
+    def _locator_for_cut(self, track: str, at: float) -> tuple[str, int]:
+        """找出「结束于剪辑点 at」的片段（转场要对齐它的出点）。"""
+
+        clips = self._sorted_clips(track)
+        tolerance = 0.5
+        for index, clip in enumerate(clips):
+            end = self._seconds(getattr(clip, "end", None))
+            if abs(end - float(at)) <= tolerance:
+                return self._clip_key(clips, index)
+        raise PremiereError(
+            f"{track} 轨上找不到结束于 {at:.2f}s 的片段（转场必须落在剪辑点上，"
+            "请先用 append_clip/insert_clip 排好片段）"
+        )
+
+    def _locator_at_time(self, track: str, start: float) -> tuple[str, int]:
+        """找出包含时刻 start 的片段，返回（名字, 同名片段里的次序）。"""
+
+        clips = self._sorted_clips(track)
+        for index, clip in enumerate(clips):
+            clip_start = self._seconds(getattr(clip, "start", None))
+            clip_end = self._seconds(getattr(clip, "end", None))
+            if clip_start - 0.05 <= float(start) < clip_end:
+                return self._clip_key(clips, index)
+        raise PremiereError(f"{track} 轨上 {start:.2f}s 处没有片段")
+
+    @staticmethod
+    def _clip_key(clips: list[Any], index: int) -> tuple[str, int]:
+        name = str(getattr(clips[index], "name", "") or "")
+        occurrence = sum(
+            1
+            for other in clips[:index]
+            if str(getattr(other, "name", "") or "") == name
+        )
+        return name, occurrence
+
+    def _sorted_clips(self, track: str) -> list[Any]:
+        return sorted(
+            self._clips(self._track(track)),
+            key=lambda item: self._seconds(getattr(item, "start", None)),
+        )
+
+    # ---------------------------------------------------------------- 名字解析
+    def _object_names(self, method: str, cache_attribute: str) -> list[str]:
+        cached = getattr(self, cache_attribute)
+        if cached is not None:
+            return cached
+        try:
+            names = self._eval(f"ExtendJSON.stringify(qe.project.{method}())")
+        except Exception as exc:  # noqa: BLE001 - 老版本没有列表接口时退化成「不做解析」
+            logger.debug("读取 %s 失败：%s", method, exc)
+            names = []
+        catalog = [str(name) for name in names] if isinstance(names, list) else []
+        setattr(self, cache_attribute, catalog)
+        return catalog
+
+    def _resolve_effect_name(self, effect: str) -> str:
+        return self._match_catalog(
+            effect,
+            self._object_names("getVideoEffectList", "_effect_catalog"),
+            aliases=EFFECT_ALIASES,
+            kind="效果",
+        )
+
+    def _resolve_transition_name(self, transition: str) -> str:
+        wanted = TRANSITION_NAMES.get(transition, transition)
+        return self._match_catalog(
+            wanted,
+            self._object_names("getVideoTransitionList", "_transition_catalog"),
+            aliases={},
+            kind="转场",
+        )
+
+    @classmethod
+    def _match_catalog(
+        cls,
+        wanted: str,
+        catalog: list[str],
+        *,
+        aliases: dict[str, tuple[str, ...]],
+        kind: str,
+    ) -> str:
+        """把用户/大模型给的名字解析成本机 Premiere 里真实存在的名字。"""
+
+        if not catalog:
+            return wanted
+        lowered = {name.lower(): name for name in catalog}
+
+        def by_name(candidate: str) -> str | None:
+            return lowered.get(candidate.lower())
+
+        exact = by_name(wanted)
+        if exact:
+            return exact
+        for candidate in aliases.get(wanted.lower(), ()):
+            found = by_name(candidate)
+            if found:
+                return found
+            for name in catalog:
+                if candidate.lower() in name.lower():
+                    return name
+
+        normalized = cls._normalize_name(wanted)
+        for name in catalog:
+            if cls._normalize_name(name) == normalized:
+                return name
+        for name in catalog:
+            if normalized and normalized in cls._normalize_name(name):
+                return name
+
+        from difflib import get_close_matches  # noqa: PLC0415 - 只在出错路径上用到
+
+        close = get_close_matches(wanted, catalog, n=5, cutoff=0.4)
+        hint = "、".join(close) if close else "、".join(catalog[:5])
+        raise PremiereError(
+            f"Premiere 里没有名为「{wanted}」的{kind}。"
+            f"本机可用（部分）：{hint}。中文版 Premiere 的{kind}名是本地化的，"
+            f"可在 Premiere 的{kind}面板里确认准确名称"
+        )
+
+    @staticmethod
+    def _normalize_name(value: str) -> str:
+        """归一化：去掉空格/大小写/括号后缀（"高斯模糊（旧版）" → "高斯模糊旧版"）。"""
+
+        text = str(value).lower()
+        for token in (" ", "\t", "-", "_", "(", ")", "（", "）", "&", "·"):
+            text = text.replace(token, "")
+        return text
+
+    def _component_names(self, handle: ClipHandle) -> list[str]:
+        clip = self._native_clip(handle)
+        try:
+            return [
+                str(getattr(component, "displayName", "")) for component in clip.components
+            ]
+        except Exception as exc:  # noqa: BLE001 - 读组件失败不该让整条方案失败
+            logger.debug("读取 %s 的组件失败：%s", handle.ref, exc)
+            return []
+
+    def _clip_has_component(self, handle: ClipHandle, effect_name: str) -> bool:
+        wanted = self._normalize_name(effect_name)
+        return any(self._normalize_name(name) == wanted for name in self._component_names(handle))
+
+    def _property_names(self, handle: ClipHandle) -> list[str]:
+        clip = self._native_clip(handle)
+        names: list[str] = []
+        try:
+            for component in clip.components:
+                for prop in component.properties:
+                    display = str(getattr(prop, "displayName", ""))
+                    if display:
+                        names.append(display)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("读取 %s 的参数名失败：%s", handle.ref, exc)
+        return sorted(set(names))
 
     def _set_effect_params(self, handle: ClipHandle, params: dict) -> set[str]:
         """按参数的显示名去效果组件上匹配并写值（Lumetri 之类参数名区分大小写）。"""
@@ -912,18 +1188,36 @@ class PymierePremiereAdapter(PremiereAdapter):
         return applied
 
     def set_volume(self, handle: ClipHandle, *, db: float) -> None:
+        """调音量。
+
+        真机结论：音量挂在片段的 **Volume 组件**上，而这个组件只存在于**音频**片段里——
+        插到 V 轨的片段只有视频部分，根本没有音频组件；另外组件/参数名是界面语言的
+        （中文版是「音量 / 级别」），所以两边都要按多种写法匹配。
+        """
+
         clip = self._native_clip(handle)
         try:
             for component in clip.components:
-                if "volume" not in str(getattr(component, "displayName", "")).lower():
+                display = str(getattr(component, "displayName", "")).lower()
+                match_name = str(getattr(component, "matchName", "")).lower()
+                if not any(token in display or token in match_name for token in ("volume", "音量", "audio")):
                     continue
                 for prop in component.properties:
-                    if "level" in str(getattr(prop, "displayName", "")).lower():
+                    prop_display = str(getattr(prop, "displayName", "")).lower()
+                    prop_match = str(getattr(prop, "matchName", "")).lower()
+                    if any(
+                        token in prop_display or token in prop_match
+                        for token in ("level", "级别", "音量", "gain", "增益")
+                    ):
                         prop.setValue(float(db), True)
                         return
         except Exception as exc:  # pragma: no cover
             raise PremiereError(f"设置音量失败（{handle.ref}）：{exc}") from exc
-        raise PremiereError(f"片段 {handle.ref} 上找不到 Volume/Level 参数，无法设置音量")
+        raise PremiereError(
+            f"片段 {handle.ref} 上找不到 Volume/Level 参数，无法设置音量。"
+            f"该片段的组件是：{'、'.join(self._component_names(handle)) or '无'}；"
+            "注意插到 V 轨的片段只有视频部分，音量参数只存在于音频片段上"
+        )
 
     def add_marker(self, *, at: float, name: str, color: str, duration: float) -> None:
         sequence = self._sequence_or_fail()
@@ -988,7 +1282,9 @@ class PymierePremiereAdapter(PremiereAdapter):
             fps=settings["fps"],
         )
         self._clip_registry.clear()
+        known_handles = dict(self._handles)
         self._handles.clear()
+        natives: list[tuple[str, float, Any]] = []
         for kind, prefix, collection in (
             ("video", "V", sequence.videoTracks),
             ("audio", "A", sequence.audioTracks),
@@ -1000,6 +1296,7 @@ class PymierePremiereAdapter(PremiereAdapter):
                     name = str(getattr(clip, "name", f"clip{position}"))
                     clip_id = f"{track.name}:{position}:{name}"
                     self._clip_registry[clip_id] = clip
+                    natives.append((track.name, self._seconds(getattr(clip, "start", None)), clip))
                     track.clips.append(
                         TimelineClip(
                             id=clip_id,
@@ -1012,7 +1309,11 @@ class PymierePremiereAdapter(PremiereAdapter):
                             source_out=self._seconds(getattr(clip, "outPoint", None)),
                         )
                     )
+                    state.effects.extend(self._collect_effects(clip, clip_id))
+                state.transitions.extend(self._collect_transitions(native_track, track.name))
                 state.tracks.append(track)
+
+        self._rebind_handles(known_handles, natives)
 
         try:
             for marker in self._collect_markers(sequence):
@@ -1020,6 +1321,79 @@ class PymierePremiereAdapter(PremiereAdapter):
         except Exception as exc:  # pragma: no cover
             logger.debug("读取标记失败：%s", exc)
         return state
+
+    def _rebind_handles(
+        self, handles: dict[str, ClipHandle], natives: list[tuple[str, float, Any]]
+    ) -> None:
+        """重建注册表后，把方案里用过的片段引用（handle.ref）重新挂到当前片段对象上。
+
+        快照会用「轨道:序号:名字」重建索引，如果不重新绑定，任何一次中途快照之后
+        trim_clip / move_clip / apply_effect 都会报「找不到片段」。
+        """
+
+        for ref, handle in handles.items():
+            candidates = [
+                (abs(start - handle.start), clip) for track, start, clip in natives if track == handle.track
+            ]
+            if not candidates:
+                continue
+            _, clip = min(candidates, key=lambda item: item[0])
+            self._clip_registry[ref] = clip
+            self._handles[ref] = handle
+
+    def _collect_effects(self, native_clip: Any, clip_id: str) -> list[TimelineEffect]:
+        """读片段上我们加过的效果（跳过 Premiere 自带的运动/不透明度/音量组件）。"""
+
+        effects: list[TimelineEffect] = []
+        try:
+            for component in native_clip.components:
+                display = str(getattr(component, "displayName", "") or "")
+                match_name = str(getattr(component, "matchName", "") or "")
+                if not display or self._is_builtin_component(display, match_name):
+                    continue
+                effects.append(TimelineEffect(clip_id=clip_id, effect=display, params={}))
+        except Exception as exc:  # noqa: BLE001 - 读组件失败不该让整个快照失败
+            logger.debug("读取 %s 的效果失败：%s", clip_id, exc)
+        return effects
+
+    @staticmethod
+    def _is_builtin_component(display: str, match_name: str) -> bool:
+        if match_name in BUILTIN_COMPONENT_MATCHES or "volume" in match_name.lower():
+            return True
+        return display.strip().lower() in BUILTIN_COMPONENT_NAMES
+
+    def _collect_transitions(
+        self, native_track: Any, track_name: str
+    ) -> list[TimelineTransition]:
+        """读轨道上的转场。
+
+        真机结论（PR 2026）：转场挂在 **Track.transitions** 上，片段的 ``transitions`` 是 undefined，
+        所以只能按轨道读；``start`` 就是剪辑点，``duration`` 是 Premiere 实际用的时长。
+        """
+
+        collection = getattr(native_track, "transitions", None)
+        if collection is None:
+            return []
+        try:
+            count = int(getattr(collection, "numItems", 0) or 0)
+        except (TypeError, ValueError):  # pragma: no cover - 属性异常时当作没有转场
+            return []
+        transitions: list[TimelineTransition] = []
+        for index in range(count):
+            try:
+                native = collection[index]
+            except Exception as exc:  # noqa: BLE001 - 集合不能索引时放弃剩余的
+                logger.debug("读取 %s 轨第 %s 个转场失败：%s", track_name, index, exc)
+                break
+            transitions.append(
+                TimelineTransition(
+                    track=track_name,
+                    at=round(self._safe_seconds(native, "start"), 3),
+                    transition=str(getattr(native, "name", "") or "transition"),
+                    duration=round(self._safe_seconds(native, "duration"), 3),
+                )
+            )
+        return transitions
 
     def _collect_markers(self, sequence: Any) -> list[TimelineMarker]:
         """pymiere 的 MarkerCollection 没有实现遍历/索引，只能退化成取首尾标记。"""
@@ -1093,15 +1467,36 @@ class PymierePremiereAdapter(PremiereAdapter):
     def _qe_track_expr(track: str) -> str:
         """QE 轨道对象的 ExtendScript 表达式。
 
-        QE 只能从 ExtendScript 里直接调：pymiere 把 QE 包成 PymiereGenericObject，靠 reflect
-        查方法名，而真机上 QE 对象查不到 `getVideoTrackAt`，所以这里一律发原生脚本。
+        两个真机结论（PR 2026）：
+        1. QE 只能从 ExtendScript 里直接调——pymiere 把 QE 包成 PymiereGenericObject，
+           靠 reflect 查方法名，而 QE 对象上查不到这些方法；
+        2. QE 的 ``project`` 上没有 ``getVideoTrackAt``，轨道必须从 ``getActiveSequence()`` 上取。
         """
 
         upper = track.upper()
         digits = upper[1:] if upper[1:].isdigit() else "1"
         index = max(0, int(digits) - 1)
         getter = "getVideoTrackAt" if upper.startswith("V") else "getAudioTrackAt"
-        return f"qe.project.{getter}({index})"
+        return f"qe.project.getActiveSequence().{getter}({index})"
+
+    def _assert_sequence_active(self) -> None:
+        """QE 的操作都作用在「活动序列」上，先确认我们要动的那条就是活动的。"""
+
+        sequence = self._sequence_or_fail()
+        try:
+            active = self._project().activeSequence
+        except Exception as exc:  # pragma: no cover
+            logger.debug("读取活动序列失败：%s", exc)
+            return
+        if active is None:
+            raise PremiereError("Premiere 里没有活动序列，QE 操作无法执行")
+        wanted = str(getattr(sequence, "name", ""))
+        current = str(getattr(active, "name", ""))
+        if wanted and current and wanted != current:
+            raise PremiereError(
+                f"QE 只能操作活动序列，当前活动序列是「{current}」，而方案要改的是「{wanted}」。"
+                "请先在 Premiere 里把目标序列切为活动序列"
+            )
 
     def _timecode(self, seconds: float) -> str:
         """把秒转成序列显示格式的时间码（QE 的 razor/addTransition 需要）。"""
